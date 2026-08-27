@@ -71,6 +71,7 @@ const APP_FILTER_ICON: Record<AppType, string> = {
   gemini: "gemini",
   grokbuild: "grok",
   opencode: "opencode",
+  "cherry-studio": "cherry-studio",
   pi: "pi",
 };
 
