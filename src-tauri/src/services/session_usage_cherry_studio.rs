@@ -80,7 +80,7 @@ fn sync_cherry_studio_usage_from_path(
     }
 
     let db_path_str = db_path.to_string_lossy().to_string();
-    let metadata = fs::metadata(&db_path).map_err(|error| AppError::io(&db_path, error))?;
+    let metadata = fs::metadata(db_path).map_err(|error| AppError::io(db_path, error))?;
     let mut modified = metadata_modified_nanos(&metadata);
     let wal_path = PathBuf::from(format!("{}-wal", db_path.display()));
     if let Ok(wal_metadata) = fs::metadata(wal_path) {
@@ -96,7 +96,7 @@ fn sync_cherry_studio_usage_from_path(
     }
 
     let cherry =
-        rusqlite::Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(|error| {
                 AppError::Database(format!("无法只读打开 Cherry Studio 数据库: {error}"))
             })?;
