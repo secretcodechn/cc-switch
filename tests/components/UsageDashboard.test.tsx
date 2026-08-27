@@ -146,6 +146,29 @@ describe("UsageDashboard", () => {
     );
   });
 
+  it("exposes imported Cherry Studio usage as an application filter", async () => {
+    renderDashboard();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "usage.appFilter.cherry-studio" }),
+    );
+
+    expect(
+      screen.getByRole("img", { name: "usage.appFilter.cherry-studio" }),
+    ).toHaveAttribute("src", expect.stringContaining("cherry-studio.png"));
+
+    await waitFor(() =>
+      expect(useProviderStatsMock).toHaveBeenLastCalledWith(
+        expect.anything(),
+        { appType: "cherry-studio" },
+        expect.anything(),
+      ),
+    );
+    expect(usageHeroMock).toHaveBeenLastCalledWith(
+      expect.objectContaining({ appType: "cherry-studio" }),
+    );
+  });
+
   it("persists refresh interval changes", async () => {
     const onRefreshIntervalChange = vi.fn().mockResolvedValue(true);
     renderDashboard({ onRefreshIntervalChange });
