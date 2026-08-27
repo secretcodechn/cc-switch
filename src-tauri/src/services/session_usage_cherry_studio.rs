@@ -9,7 +9,7 @@ use crate::services::session_usage::{
     get_sync_state, metadata_modified_nanos, update_sync_state, SessionSyncResult,
 };
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const APP_TYPE: &str = "cherry-studio";
 const DATA_SOURCE: &str = "cherry_studio";
@@ -68,6 +68,13 @@ pub fn get_cherry_studio_db_path() -> PathBuf {
 /// Imports newly committed Cherry Studio usage records.
 pub fn sync_cherry_studio_usage(db: &Database) -> Result<SessionSyncResult, AppError> {
     let db_path = get_cherry_studio_db_path();
+    sync_cherry_studio_usage_from_path(db, &db_path)
+}
+
+fn sync_cherry_studio_usage_from_path(
+    db: &Database,
+    db_path: &Path,
+) -> Result<SessionSyncResult, AppError> {
     if !db_path.exists() {
         return Ok(SessionSyncResult::default());
     }
@@ -204,7 +211,6 @@ fn query_usage_records(conn: &rusqlite::Connection) -> Result<Vec<CherryUsageRec
 fn insert_usage_record(db: &Database, record: &CherryUsageRecord) -> Result<bool, AppError> {
     let conn = lock_conn!(db.conn);
     let request_id = format!("cherry_studio:{}", record.request_id);
-    let provider_id = format!("cherry_studio:{}", record.provider_id);
     let inserted = conn.execute(
         "INSERT OR IGNORE INTO proxy_request_logs (
             request_id, provider_id, app_type, model, request_model,
@@ -217,7 +223,7 @@ fn insert_usage_record(db: &Database, record: &CherryUsageRecord) -> Result<bool
                   ?10, ?11, ?12, ?13, 200, NULL, NULL, ?14, 1, '1.0', ?15, ?16)",
         rusqlite::params![
             request_id,
-            provider_id,
+            record.provider_name,
             APP_TYPE,
             record.model_id,
             record.model_id,
@@ -229,7 +235,7 @@ fn insert_usage_record(db: &Database, record: &CherryUsageRecord) -> Result<bool
             record.duration_ms,
             record.first_token_ms,
             record.duration_ms,
-            record.provider_name,
+            record.provider_id,
             record.created_at,
             DATA_SOURCE,
         ],
@@ -240,6 +246,111 @@ fn insert_usage_record(db: &Database, record: &CherryUsageRecord) -> Result<bool
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_cherry_database_is_a_noop() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        let temp = tempfile::tempdir().unwrap();
+
+        let result = sync_cherry_studio_usage_from_path(&db, &temp.path().join("missing.sqlite"))?;
+
+        assert_eq!(result.imported, 0);
+        assert_eq!(result.files_scanned, 0);
+        assert!(result.errors.is_empty());
+        let conn = lock_conn!(db.conn);
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM proxy_request_logs", [], |row| {
+            row.get(0)
+        })?;
+        assert_eq!(count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn import_is_scoped_to_cherry_usage_and_preserves_other_apps() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        {
+            let conn = lock_conn!(db.conn);
+            conn.execute(
+                "INSERT INTO proxy_request_logs (
+                    request_id, provider_id, app_type, model, request_model,
+                    input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
+                    total_cost_usd, latency_ms, status_code, created_at, data_source
+                ) VALUES ('existing-claude', 'anthropic', 'claude', 'claude-test',
+                          'claude-test', 7, 3, 0, 0, '0.01', 10, 200, 1, 'proxy')",
+                [],
+            )?;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let cherry_path = temp.path().join("cherrystudio.sqlite");
+        let cherry = rusqlite::Connection::open(&cherry_path)?;
+        cherry.execute_batch(
+            "CREATE TABLE ai_usage_record (
+                id TEXT, request_id TEXT, provider_id TEXT, provider_name TEXT,
+                model_id TEXT, model_name TEXT, modality TEXT, input_tokens INTEGER,
+                output_tokens INTEGER, no_cache_tokens INTEGER, cache_read_tokens INTEGER,
+                cache_write_tokens INTEGER, cost REAL, cost_currency TEXT,
+                time_first_token_ms INTEGER, time_completion_ms INTEGER, created_at INTEGER
+             );
+             INSERT INTO ai_usage_record VALUES
+                ('1', 'language', 'openai', 'OpenAI', 'gpt-test', 'GPT Test',
+                 'language', 100, 20, 60, 30, 10, 0.5, 'USD', 12, 34, 2000),
+                ('2', 'embedding', 'openai', 'OpenAI', 'embed-test', NULL,
+                 'embedding', 50, 0, 50, 0, 0, 0.1, 'USD', NULL, 10, 3000);",
+        )?;
+        drop(cherry);
+
+        let first = sync_cherry_studio_usage_from_path(&db, &cherry_path)?;
+        assert_eq!(first.imported, 1);
+        assert!(first.errors.is_empty());
+
+        let second = sync_cherry_studio_usage_from_path(&db, &cherry_path)?;
+        assert_eq!(second.imported, 0);
+        assert!(second.errors.is_empty());
+
+        let conn = lock_conn!(db.conn);
+        let claude_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM proxy_request_logs
+             WHERE request_id = 'existing-claude' AND app_type = 'claude'
+               AND input_tokens = 7 AND output_tokens = 3",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(claude_count, 1);
+
+        let cherry_row: (i64, String, String, String, i64, i64, i64, i64) = conn.query_row(
+            "SELECT COUNT(*), data_source, provider_id, provider_type, input_tokens,
+                    output_tokens, cache_read_tokens, cache_creation_tokens
+             FROM proxy_request_logs WHERE app_type = 'cherry-studio'",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            },
+        )?;
+        assert_eq!(
+            cherry_row,
+            (
+                1,
+                "cherry_studio".into(),
+                "OpenAI".into(),
+                "openai".into(),
+                60,
+                20,
+                30,
+                10
+            )
+        );
+        Ok(())
+    }
 
     #[test]
     fn query_normalizes_cherry_input_and_currency() {

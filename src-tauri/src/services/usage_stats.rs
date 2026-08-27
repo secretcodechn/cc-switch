@@ -210,17 +210,14 @@ fn row_to_request_log_detail(row: &rusqlite::Row<'_>) -> rusqlite::Result<Reques
 /// authoritative mapping from placeholder to readable name.
 fn provider_name_coalesce(log_alias: &str, provider_alias: &str) -> String {
     format!(
-        "COALESCE({provider_alias}.name, CASE \
-         WHEN {log_alias}.app_type = 'cherry-studio' THEN {log_alias}.provider_type \
-         ELSE CASE {log_alias}.provider_id \
-           WHEN '_session' THEN 'Claude (Session)' \
-           WHEN '_codex_session' THEN 'Codex (Session)' \
-           WHEN '_gemini_session' THEN 'Gemini (Session)' \
-           WHEN '_opencode_session' THEN 'OpenCode (Session)' \
-           WHEN '_grok_session' THEN 'Grok Build (Session)' \
-           WHEN '_pi_session' THEN 'Pi (Session)' \
-           ELSE {log_alias}.provider_id END \
-         END)"
+        "COALESCE({provider_alias}.name, CASE {log_alias}.provider_id \
+         WHEN '_session' THEN 'Claude (Session)' \
+         WHEN '_codex_session' THEN 'Codex (Session)' \
+         WHEN '_gemini_session' THEN 'Gemini (Session)' \
+         WHEN '_opencode_session' THEN 'OpenCode (Session)' \
+         WHEN '_grok_session' THEN 'Grok Build (Session)' \
+         WHEN '_pi_session' THEN 'Pi (Session)' \
+         ELSE {log_alias}.provider_id END)"
     )
 }
 
