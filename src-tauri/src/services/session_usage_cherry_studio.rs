@@ -79,6 +79,8 @@ fn sync_cherry_studio_usage_from_path(
         return Ok(SessionSyncResult::default());
     }
 
+    backfill_dedup_ledger(db)?;
+
     let db_path_str = db_path.to_string_lossy().to_string();
     let metadata = fs::metadata(db_path).map_err(|error| AppError::io(db_path, error))?;
     let mut modified = metadata_modified_nanos(&metadata);
@@ -147,6 +149,23 @@ fn nonnegative_u32(value: Option<i64>) -> u32 {
     value.unwrap_or(0).clamp(0, u32::MAX as i64) as u32
 }
 
+fn backfill_dedup_ledger(db: &Database) -> Result<(), AppError> {
+    let conn = lock_conn!(db.conn);
+    backfill_dedup_ledger_on_conn(&conn)
+}
+
+pub(crate) fn backfill_dedup_ledger_on_conn(conn: &rusqlite::Connection) -> Result<(), AppError> {
+    conn.execute(
+        "INSERT OR IGNORE INTO session_usage_dedup
+         (data_source, request_id, semantic_id, has_entry_id)
+         SELECT ?1, request_id, request_id, 1
+         FROM proxy_request_logs
+         WHERE app_type = ?2 AND data_source = ?1",
+        rusqlite::params![DATA_SOURCE, APP_TYPE],
+    )?;
+    Ok(())
+}
+
 fn query_usage_records(conn: &rusqlite::Connection) -> Result<Vec<CherryUsageRecord>, AppError> {
     let mut stmt = conn
         .prepare(
@@ -209,10 +228,21 @@ fn query_usage_records(conn: &rusqlite::Connection) -> Result<Vec<CherryUsageRec
 }
 
 fn insert_usage_record(db: &Database, record: &CherryUsageRecord) -> Result<bool, AppError> {
-    let conn = lock_conn!(db.conn);
+    let mut conn = lock_conn!(db.conn);
+    let tx = conn.transaction()?;
     let request_id = format!("cherry_studio:{}", record.request_id);
-    let inserted = conn.execute(
-        "INSERT OR IGNORE INTO proxy_request_logs (
+    let ledger_inserted = tx.execute(
+        "INSERT OR IGNORE INTO session_usage_dedup
+         (data_source, request_id, semantic_id, has_entry_id)
+         VALUES (?1, ?2, ?2, 1)",
+        rusqlite::params![DATA_SOURCE, request_id],
+    )?;
+    if ledger_inserted == 0 {
+        return Ok(false);
+    }
+
+    tx.execute(
+        "INSERT INTO proxy_request_logs (
             request_id, provider_id, app_type, model, request_model,
             input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
             input_cost_usd, output_cost_usd, cache_read_cost_usd,
@@ -240,7 +270,8 @@ fn insert_usage_record(db: &Database, record: &CherryUsageRecord) -> Result<bool
             DATA_SOURCE,
         ],
     )?;
-    Ok(inserted > 0)
+    tx.commit()?;
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -262,6 +293,45 @@ mod tests {
             row.get(0)
         })?;
         assert_eq!(count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn backfill_only_captures_legacy_cherry_details() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        {
+            let conn = lock_conn!(db.conn);
+            conn.execute_batch(
+                "INSERT INTO proxy_request_logs
+                    (request_id, provider_id, app_type, model, input_tokens, output_tokens,
+                     latency_ms, status_code, created_at, data_source)
+                 VALUES
+                    ('cherry_studio:old', 'OpenAI', 'cherry-studio', 'gpt-test',
+                     10, 2, 5, 200, 1, 'cherry_studio'),
+                    ('existing-claude', 'anthropic', 'claude', 'claude-test',
+                     7, 3, 5, 200, 1, 'proxy');",
+            )?;
+        }
+
+        backfill_dedup_ledger(&db)?;
+        backfill_dedup_ledger(&db)?;
+
+        let conn = lock_conn!(db.conn);
+        let rows: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM session_usage_dedup
+             WHERE data_source = 'cherry_studio'
+               AND request_id = 'cherry_studio:old'
+               AND semantic_id = 'cherry_studio:old'",
+            [],
+            |row| row.get(0),
+        )?;
+        let unrelated_rows: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM session_usage_dedup WHERE request_id = 'existing-claude'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(rows, 1);
+        assert_eq!(unrelated_rows, 0);
         Ok(())
     }
 
@@ -349,6 +419,136 @@ mod tests {
                 10
             )
         );
+        let cherry_dedup_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM session_usage_dedup WHERE data_source = 'cherry_studio'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(cherry_dedup_count, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn durable_dedup_prevents_reimport_after_detail_rollup() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        let temp = tempfile::tempdir().unwrap();
+        let cherry_path = temp.path().join("cherrystudio.sqlite");
+        let cherry = rusqlite::Connection::open(&cherry_path)?;
+        cherry.execute_batch(
+            "CREATE TABLE ai_usage_record (
+                id TEXT, request_id TEXT, provider_id TEXT, provider_name TEXT,
+                model_id TEXT, model_name TEXT, modality TEXT, input_tokens INTEGER,
+                output_tokens INTEGER, no_cache_tokens INTEGER, cache_read_tokens INTEGER,
+                cache_write_tokens INTEGER, cost REAL, cost_currency TEXT,
+                time_first_token_ms INTEGER, time_completion_ms INTEGER, created_at INTEGER
+             );
+             INSERT INTO ai_usage_record VALUES
+                ('1', 'old', 'openai', 'OpenAI', 'gpt-test', 'GPT Test',
+                 'language', 100, 20, 60, 30, 10, 0.5, 'USD', 12, 34, 2000);",
+        )?;
+        drop(cherry);
+
+        let first = sync_cherry_studio_usage_from_path(&db, &cherry_path)?;
+        assert_eq!(first.imported, 1);
+        assert_eq!(db.rollup_and_prune(30)?, 1);
+
+        let cherry = rusqlite::Connection::open(&cherry_path)?;
+        cherry.execute(
+            "INSERT INTO ai_usage_record VALUES
+             ('2', 'new', 'openai', 'OpenAI', 'gpt-test', 'GPT Test',
+              'language', 80, 10, 50, 20, 10, 0.25, 'USD', 8, 21, 3000)",
+            [],
+        )?;
+        drop(cherry);
+        {
+            let conn = lock_conn!(db.conn);
+            conn.execute(
+                "UPDATE session_log_sync SET last_modified = 0 WHERE file_path = ?1",
+                [cherry_path.to_string_lossy().as_ref()],
+            )?;
+        }
+
+        let second = sync_cherry_studio_usage_from_path(&db, &cherry_path)?;
+        assert_eq!(second.imported, 1);
+        assert_eq!(second.skipped, 1);
+
+        let conn = lock_conn!(db.conn);
+        let detail_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM proxy_request_logs
+             WHERE app_type = 'cherry-studio' AND data_source = 'cherry_studio'",
+            [],
+            |row| row.get(0),
+        )?;
+        let rollup_count: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(request_count), 0) FROM usage_daily_rollups
+             WHERE app_type = 'cherry-studio'",
+            [],
+            |row| row.get(0),
+        )?;
+        let dedup_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM session_usage_dedup WHERE data_source = 'cherry_studio'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(detail_count, 1);
+        assert_eq!(rollup_count, 1);
+        assert_eq!(dedup_count, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn startup_rollup_backfills_legacy_dedup_before_cherry_sync() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        {
+            let conn = lock_conn!(db.conn);
+            conn.execute(
+                "INSERT INTO proxy_request_logs (
+                    request_id, provider_id, app_type, model, request_model,
+                    input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
+                    total_cost_usd, latency_ms, status_code, created_at, data_source
+                 ) VALUES ('cherry_studio:legacy', 'OpenAI', 'cherry-studio', 'gpt-test',
+                           'gpt-test', 60, 20, 30, 10, '0.5', 34, 200, 1,
+                           'cherry_studio')",
+                [],
+            )?;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let cherry_path = temp.path().join("cherrystudio.sqlite");
+        let cherry = rusqlite::Connection::open(&cherry_path)?;
+        cherry.execute_batch(
+            "CREATE TABLE ai_usage_record (
+                id TEXT, request_id TEXT, provider_id TEXT, provider_name TEXT,
+                model_id TEXT, model_name TEXT, modality TEXT, input_tokens INTEGER,
+                output_tokens INTEGER, no_cache_tokens INTEGER, cache_read_tokens INTEGER,
+                cache_write_tokens INTEGER, cost REAL, cost_currency TEXT,
+                time_first_token_ms INTEGER, time_completion_ms INTEGER, created_at INTEGER
+             );
+             INSERT INTO ai_usage_record VALUES
+                ('1', 'legacy', 'openai', 'OpenAI', 'gpt-test', 'GPT Test',
+                 'language', 100, 20, 60, 30, 10, 0.5, 'USD', 12, 34, 2000);",
+        )?;
+        drop(cherry);
+
+        assert_eq!(db.rollup_and_prune(30)?, 1);
+        let sync = sync_cherry_studio_usage_from_path(&db, &cherry_path)?;
+        assert_eq!(sync.imported, 0);
+        assert_eq!(sync.skipped, 1);
+
+        let conn = lock_conn!(db.conn);
+        let counts: (i64, i64, i64) = conn.query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM proxy_request_logs
+                 WHERE request_id = 'cherry_studio:legacy'),
+                (SELECT COALESCE(SUM(request_count), 0) FROM usage_daily_rollups
+                 WHERE app_type = 'cherry-studio'),
+                (SELECT COUNT(*) FROM session_usage_dedup
+                 WHERE data_source = 'cherry_studio'
+                   AND request_id = 'cherry_studio:legacy')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(counts, (0, 1, 1));
         Ok(())
     }
 
