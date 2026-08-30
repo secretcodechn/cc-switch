@@ -6,7 +6,7 @@
 use crate::database::{lock_conn, Database};
 use crate::error::AppError;
 use crate::services::session_usage::{
-    get_sync_state, metadata_modified_nanos, update_sync_state, SessionSyncResult,
+    load_sync_cursors, metadata_modified_nanos, update_sync_state, SessionSyncResult,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -89,7 +89,8 @@ fn sync_cherry_studio_usage_from_path(
         modified = modified.max(metadata_modified_nanos(&wal_metadata));
     }
 
-    let (last_modified, _) = get_sync_state(db, &db_path_str)?;
+    let cursors = load_sync_cursors(db)?;
+    let last_modified = cursors.get(&db_path_str).map_or(0, |c| c.last_modified);
     if modified <= last_modified {
         return Ok(SessionSyncResult {
             files_scanned: 1,
