@@ -161,21 +161,43 @@ fn max_usage_rowid(conn: &rusqlite::Connection) -> Result<i64, AppError> {
     .map_err(|error| AppError::Database(format!("读取 Cherry Studio 用量游标失败: {error}")))
 }
 
+fn has_usage_column(conn: &rusqlite::Connection, column: &str) -> Result<bool, AppError> {
+    conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM pragma_table_info('ai_usage_record') WHERE name = ?1
+         )",
+        [column],
+        |row| row.get(0),
+    )
+    .map_err(|error| AppError::Database(format!("检查 Cherry Studio 用量字段失败: {error}")))
+}
+
 fn query_usage_records(
     conn: &rusqlite::Connection,
     after_rowid: i64,
     through_rowid: i64,
 ) -> Result<Vec<CherryUsageRecord>, AppError> {
+    // Migrated aggregate rows represent multiple requests and cannot be
+    // losslessly expressed in the detail table, whose request count is
+    // COUNT(*). Older Cherry schemas do not have record_kind, so only add the
+    // predicate when the column exists.
+    let record_kind_filter = if has_usage_column(conn, "record_kind")? {
+        "AND COALESCE(record_kind, '') <> 'legacy-aggregate'"
+    } else {
+        ""
+    };
+    let query = format!(
+        "SELECT request_id, provider_id, provider_name, model_id, model_name,
+                input_tokens, output_tokens, no_cache_tokens,
+                cache_read_tokens, cache_write_tokens, cost, cost_currency,
+                time_first_token_ms, time_completion_ms, created_at
+         FROM ai_usage_record
+         WHERE rowid > ?1 AND rowid <= ?2 AND modality = 'language'
+         {record_kind_filter}
+         ORDER BY rowid"
+    );
     let mut stmt = conn
-        .prepare(
-            "SELECT request_id, provider_id, provider_name, model_id, model_name,
-                    input_tokens, output_tokens, no_cache_tokens,
-                    cache_read_tokens, cache_write_tokens, cost, cost_currency,
-                    time_first_token_ms, time_completion_ms, created_at
-             FROM ai_usage_record
-             WHERE rowid > ?1 AND rowid <= ?2 AND modality = 'language'
-             ORDER BY rowid",
-        )
+        .prepare(&query)
         .map_err(|error| AppError::Database(format!("准备 Cherry Studio 用量查询失败: {error}")))?;
 
     let rows = stmt
@@ -702,5 +724,35 @@ mod tests {
         assert_eq!(records[1].input_tokens, 55);
         assert_eq!(records[1].model_id, "m1");
         assert_eq!(records[1].total_cost_usd, 0.0);
+    }
+
+    #[test]
+    fn query_excludes_migrated_legacy_aggregates() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE ai_usage_record (
+                id TEXT, request_id TEXT, provider_id TEXT, provider_name TEXT,
+                model_id TEXT, model_name TEXT, modality TEXT, input_tokens INTEGER,
+                output_tokens INTEGER, no_cache_tokens INTEGER, cache_read_tokens INTEGER,
+                cache_write_tokens INTEGER, cost REAL, cost_currency TEXT,
+                time_first_token_ms INTEGER, time_completion_ms INTEGER, created_at INTEGER,
+                record_kind TEXT, request_count INTEGER
+             );
+             INSERT INTO ai_usage_record VALUES
+                ('1', 'aggregate', 'p1', 'Provider', 'm1', 'Model', 'language',
+                 1000, 200, 800, 100, 100, 5.0, 'USD', NULL, 300, 2000,
+                 'legacy-aggregate', 10),
+                ('2', 'detail', 'p1', 'Provider', 'm1', 'Model', 'language',
+                 100, 20, 80, 10, 10, 0.5, 'USD', 12, 34, 3000,
+                 'detail', 1);",
+        )
+        .unwrap();
+
+        let max_rowid = max_usage_rowid(&conn).unwrap();
+        let records = query_usage_records(&conn, 0, max_rowid).unwrap();
+
+        assert_eq!(max_rowid, 2);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].request_id, "detail");
     }
 }
