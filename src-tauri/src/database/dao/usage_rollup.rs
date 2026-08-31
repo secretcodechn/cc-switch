@@ -63,6 +63,11 @@ impl Database {
         let cutoff = compute_local_midnight_cutoff(Local::now(), retain_days)?;
         let conn = lock_conn!(self.conn);
 
+        // Cherry Studio can reset its source rowids before retained legacy details
+        // become old enough to prune. Preserve those request IDs even when this
+        // maintenance pass has no rows to roll up.
+        crate::services::session_usage_cherry_studio::backfill_dedup_ledger_on_conn(&conn)?;
+
         // Check if there are any rows to process
         let count: i64 = conn
             .query_row(
@@ -114,11 +119,6 @@ impl Database {
     }
 
     fn do_rollup_and_prune(conn: &rusqlite::Connection, cutoff: i64) -> Result<u64, AppError> {
-        // Cherry Studio rescans its full ledger when the source database changes.
-        // Preserve legacy request IDs before their CC Switch details are deleted,
-        // otherwise the next scan would import and count those requests again.
-        crate::services::session_usage_cherry_studio::backfill_dedup_ledger_on_conn(conn)?;
-
         // Aggregate old logs, merging with any pre-existing rollup rows via LEFT JOIN.
         let effective_filter = effective_usage_log_filter("l");
         let fresh_detail_input = fresh_input_sql("l");

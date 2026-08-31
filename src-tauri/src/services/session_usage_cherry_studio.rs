@@ -5,9 +5,15 @@
 
 use crate::database::{lock_conn, Database};
 use crate::error::AppError;
+use crate::proxy::usage::calculator::{CostCalculator, ModelPricing};
+use crate::proxy::usage::parser::TokenUsage;
 use crate::services::session_usage::{
     load_sync_cursors, metadata_modified_nanos, update_sync_state_on_conn, SessionSyncResult,
 };
+use crate::services::sql_helpers::INPUT_TOKEN_SEMANTICS_FRESH;
+use crate::services::usage_stats::find_model_pricing;
+use rust_decimal::Decimal;
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -24,7 +30,6 @@ struct CherryUsageRecord {
     output_tokens: u32,
     cache_read_tokens: u32,
     cache_write_tokens: u32,
-    total_cost_usd: f64,
     first_token_ms: Option<i64>,
     duration_ms: i64,
     created_at: i64,
@@ -189,7 +194,7 @@ fn query_usage_records(
     let query = format!(
         "SELECT request_id, provider_id, provider_name, model_id, model_name,
                 input_tokens, output_tokens, no_cache_tokens,
-                cache_read_tokens, cache_write_tokens, cost, cost_currency,
+                cache_read_tokens, cache_write_tokens,
                 time_first_token_ms, time_completion_ms, created_at
          FROM ai_usage_record
          WHERE rowid > ?1 AND rowid <= ?2 AND modality = 'language'
@@ -211,10 +216,8 @@ fn query_usage_records(
                 .unwrap_or_else(|| {
                     all_input.saturating_sub(cache_read.saturating_add(cache_write))
                 });
-            let currency: Option<String> = row.get(11)?;
-            let cost: Option<f64> = row.get(10)?;
-            let first_token_ms: Option<i64> = row.get(12)?;
-            let completion_ms: Option<i64> = row.get(13)?;
+            let first_token_ms: Option<i64> = row.get(10)?;
+            let completion_ms: Option<i64> = row.get(11)?;
             let provider_id: Option<String> = row.get(1)?;
             let provider_name: Option<String> = row.get(2)?;
             let model_id: Option<String> = row.get(3)?;
@@ -224,22 +227,16 @@ fn query_usage_records(
                 request_id: row.get(0)?,
                 provider_id: provider_id.unwrap_or_else(|| "unknown".to_string()),
                 provider_name: provider_name.unwrap_or_else(|| "Cherry Studio".to_string()),
-                model_id: model_name
-                    .or(model_id)
+                model_id: model_id
+                    .or(model_name)
                     .unwrap_or_else(|| "unknown".to_string()),
                 input_tokens,
                 output_tokens: nonnegative_u32(row.get(6)?),
                 cache_read_tokens: cache_read,
                 cache_write_tokens: cache_write,
-                total_cost_usd: if currency.as_deref() == Some("USD") {
-                    cost.filter(|value| value.is_finite() && *value >= 0.0)
-                        .unwrap_or(0.0)
-                } else {
-                    0.0
-                },
                 first_token_ms: first_token_ms.filter(|value| *value >= 0),
                 duration_ms: completion_ms.unwrap_or(0).max(0),
-                created_at: row.get::<_, i64>(14)? / 1000,
+                created_at: row.get::<_, i64>(12)? / 1000,
             })
         })
         .map_err(|error| AppError::Database(format!("查询 Cherry Studio 用量失败: {error}")))?;
@@ -261,8 +258,9 @@ fn import_usage_records(
         files_scanned: 1,
         ..SessionSyncResult::default()
     };
+    let mut pricing_cache: HashMap<String, Option<ModelPricing>> = HashMap::new();
     for record in records {
-        if insert_usage_record_on_conn(&tx, record)? {
+        if insert_usage_record_on_conn(&tx, record, &mut pricing_cache)? {
             result.imported = result.imported.saturating_add(1);
         } else {
             result.skipped = result.skipped.saturating_add(1);
@@ -276,6 +274,7 @@ fn import_usage_records(
 fn insert_usage_record_on_conn(
     conn: &rusqlite::Connection,
     record: &CherryUsageRecord,
+    pricing_cache: &mut HashMap<String, Option<ModelPricing>>,
 ) -> Result<bool, AppError> {
     let request_id = format!("cherry_studio:{}", record.request_id);
     let ledger_inserted = conn.execute(
@@ -288,27 +287,67 @@ fn insert_usage_record_on_conn(
         return Ok(false);
     }
 
+    let usage = TokenUsage {
+        input_tokens: record.input_tokens,
+        output_tokens: record.output_tokens,
+        cache_read_tokens: record.cache_read_tokens,
+        cache_creation_tokens: record.cache_write_tokens,
+        model: Some(record.model_id.clone()),
+        message_id: None,
+    };
+    let pricing = pricing_cache
+        .entry(record.model_id.clone())
+        .or_insert_with(|| find_model_pricing(conn, &record.model_id));
+    let (input_cost, output_cost, cache_read_cost, cache_creation_cost, total_cost) = match pricing
+    {
+        Some(pricing) => {
+            let cost = CostCalculator::calculate_for_app(APP_TYPE, &usage, pricing, Decimal::ONE);
+            (
+                cost.input_cost.to_string(),
+                cost.output_cost.to_string(),
+                cost.cache_read_cost.to_string(),
+                cost.cache_creation_cost.to_string(),
+                cost.total_cost.to_string(),
+            )
+        }
+        None => (
+            "0".to_string(),
+            "0".to_string(),
+            "0".to_string(),
+            "0".to_string(),
+            "0".to_string(),
+        ),
+    };
+
     conn.execute(
         "INSERT INTO proxy_request_logs (
-            request_id, provider_id, app_type, model, request_model,
+            request_id, provider_id, app_type, model, request_model, pricing_model,
             input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
+            input_token_semantics,
             input_cost_usd, output_cost_usd, cache_read_cost_usd,
             cache_creation_cost_usd, total_cost_usd, latency_ms, first_token_ms,
             duration_ms, status_code, error_message, session_id, provider_type,
             is_streaming, cost_multiplier, created_at, data_source
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, '0', '0', '0', '0',
-                  ?10, ?11, ?12, ?13, 200, NULL, NULL, ?14, 1, '1.0', ?15, ?16)",
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                  ?14, ?15, ?16, ?17, ?18, ?19, 200, NULL, NULL, ?20, 1, '1.0',
+                  ?21, ?22)",
         rusqlite::params![
             request_id,
             record.provider_name,
             APP_TYPE,
             record.model_id,
             record.model_id,
+            record.model_id,
             record.input_tokens,
             record.output_tokens,
             record.cache_read_tokens,
             record.cache_write_tokens,
-            record.total_cost_usd.to_string(),
+            INPUT_TOKEN_SEMANTICS_FRESH,
+            input_cost,
+            output_cost,
+            cache_read_cost,
+            cache_creation_cost,
+            total_cost,
             record.duration_ms,
             record.first_token_ms,
             record.duration_ms,
@@ -507,6 +546,31 @@ mod tests {
                 10
             )
         );
+        let pricing: (String, String, String, String, i64) = conn.query_row(
+            "SELECT model, request_model, pricing_model, total_cost_usd,
+                    input_token_semantics
+             FROM proxy_request_logs WHERE app_type = 'cherry-studio'",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )?;
+        assert_eq!(
+            pricing,
+            (
+                "gpt-test".into(),
+                "gpt-test".into(),
+                "gpt-test".into(),
+                "0".into(),
+                INPUT_TOKEN_SEMANTICS_FRESH
+            )
+        );
         let cherry_dedup_count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM session_usage_dedup WHERE data_source = 'cherry_studio'",
             [],
@@ -642,6 +706,43 @@ mod tests {
     }
 
     #[test]
+    fn startup_rollup_backfills_recent_legacy_dedup_without_pruning() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        let recent_ts = chrono::Utc::now().timestamp();
+        {
+            let conn = lock_conn!(db.conn);
+            conn.execute(
+                "INSERT INTO proxy_request_logs (
+                    request_id, provider_id, app_type, model, request_model,
+                    input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
+                    total_cost_usd, latency_ms, status_code, created_at, data_source
+                 ) VALUES ('cherry_studio:recent-legacy', 'OpenAI', 'cherry-studio',
+                           'gpt-test', 'gpt-test', 60, 20, 30, 10, '0.5', 34, 200,
+                           ?1, 'cherry_studio')",
+                [recent_ts],
+            )?;
+        }
+
+        // A source rowid reset must be able to deduplicate this retained row even
+        // though no details are old enough for the rollup pass to prune.
+        assert_eq!(db.rollup_and_prune(30)?, 0);
+
+        let conn = lock_conn!(db.conn);
+        let counts: (i64, i64) = conn.query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM proxy_request_logs
+                 WHERE request_id = 'cherry_studio:recent-legacy'),
+                (SELECT COUNT(*) FROM session_usage_dedup
+                 WHERE data_source = 'cherry_studio'
+                   AND request_id = 'cherry_studio:recent-legacy')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(counts, (1, 1));
+        Ok(())
+    }
+
+    #[test]
     fn startup_rollup_backfills_legacy_dedup_before_cherry_sync() -> Result<(), AppError> {
         let db = Database::memory()?;
         {
@@ -698,7 +799,69 @@ mod tests {
     }
 
     #[test]
-    fn query_normalizes_cherry_input_and_currency() {
+    fn sync_prices_all_cherry_currencies_from_cc_switch_tokens() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        {
+            let conn = lock_conn!(db.conn);
+            conn.execute(
+                "INSERT OR REPLACE INTO model_pricing (
+                    model_id, display_name, input_cost_per_million,
+                    output_cost_per_million, cache_read_cost_per_million,
+                    cache_creation_cost_per_million
+                 ) VALUES ('m1', 'Model One', '1', '2', '0.5', '3')",
+                [],
+            )?;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let cherry_path = temp.path().join("cherrystudio.sqlite");
+        let cherry = rusqlite::Connection::open(&cherry_path)?;
+        cherry.execute_batch(
+            "CREATE TABLE ai_usage_record (
+                id TEXT, request_id TEXT, provider_id TEXT, provider_name TEXT,
+                model_id TEXT, model_name TEXT, modality TEXT, input_tokens INTEGER,
+                output_tokens INTEGER, no_cache_tokens INTEGER, cache_read_tokens INTEGER,
+                cache_write_tokens INTEGER, cost REAL, cost_currency TEXT,
+                time_first_token_ms INTEGER, time_completion_ms INTEGER, created_at INTEGER
+             );
+             INSERT INTO ai_usage_record VALUES
+                ('1', 'usd', 'p1', 'Provider', 'm1', 'Display Name', 'language',
+                 100, 20, 60, 30, 10, 999.0, 'USD', 12, 34, 2000),
+                ('2', 'cny', 'p1', 'Provider', 'm1', 'Display Name', 'language',
+                 100, 20, 60, 30, 10, 888.0, 'CNY', 12, 34, 3000);",
+        )?;
+        drop(cherry);
+
+        let result = sync_cherry_studio_usage_from_path(&db, &cherry_path)?;
+        assert_eq!(result.imported, 2);
+
+        let conn = lock_conn!(db.conn);
+        let mut stmt = conn.prepare(
+            "SELECT request_id, CAST(total_cost_usd AS REAL), pricing_model
+             FROM proxy_request_logs
+             WHERE data_source = 'cherry_studio'
+             ORDER BY request_id",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, f64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        assert_eq!(rows.len(), 2);
+        for (_, total_cost, pricing_model) in rows {
+            assert!((total_cost - 0.000145).abs() < 1e-12);
+            assert_eq!(pricing_model, "m1");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn query_normalizes_cherry_input_and_preserves_raw_model_id() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE ai_usage_record (
@@ -719,11 +882,9 @@ mod tests {
         assert_eq!(max_rowid, 2);
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].input_tokens, 60);
-        assert_eq!(records[0].model_id, "Model");
-        assert_eq!(records[0].total_cost_usd, 0.5);
+        assert_eq!(records[0].model_id, "m1");
         assert_eq!(records[1].input_tokens, 55);
         assert_eq!(records[1].model_id, "m1");
-        assert_eq!(records[1].total_cost_usd, 0.0);
     }
 
     #[test]
