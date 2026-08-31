@@ -6,7 +6,7 @@
 use crate::database::{lock_conn, Database};
 use crate::error::AppError;
 use crate::services::session_usage::{
-    load_sync_cursors, metadata_modified_nanos, update_sync_state, SessionSyncResult,
+    load_sync_cursors, metadata_modified_nanos, update_sync_state_on_conn, SessionSyncResult,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -79,8 +79,6 @@ fn sync_cherry_studio_usage_from_path(
         return Ok(SessionSyncResult::default());
     }
 
-    backfill_dedup_ledger(db)?;
-
     let db_path_str = db_path.to_string_lossy().to_string();
     let metadata = fs::metadata(db_path).map_err(|error| AppError::io(db_path, error))?;
     let mut modified = metadata_modified_nanos(&metadata);
@@ -90,7 +88,8 @@ fn sync_cherry_studio_usage_from_path(
     }
 
     let cursors = load_sync_cursors(db)?;
-    let last_modified = cursors.get(&db_path_str).map_or(0, |c| c.last_modified);
+    let cursor = cursors.get(&db_path_str);
+    let last_modified = cursor.map_or(0, |c| c.last_modified);
     if modified <= last_modified {
         return Ok(SessionSyncResult {
             files_scanned: 1,
@@ -112,29 +111,20 @@ fn sync_cherry_studio_usage_from_path(
         });
     }
 
-    let records = query_usage_records(&cherry)?;
-    let mut result = SessionSyncResult {
-        files_scanned: 1,
-        ..SessionSyncResult::default()
+    let source_max_rowid = max_usage_rowid(&cherry)?;
+    // Cherry records live in a normal SQLite rowid table. Reuse the generic
+    // line-offset column as the durable source cursor so steady-state polls
+    // only read newly appended rows. A replaced/truncated database can have a
+    // lower maximum rowid; restart from zero and let the durable ledger dedup
+    // the one recovery scan.
+    let saved_rowid = cursor.map_or(0, |c| c.last_line_offset.max(0));
+    let after_rowid = if source_max_rowid < saved_rowid {
+        0
+    } else {
+        saved_rowid
     };
-    for record in records {
-        match insert_usage_record(db, &record) {
-            Ok(true) => result.imported += 1,
-            Ok(false) => result.skipped += 1,
-            Err(error) => {
-                result.skipped += 1;
-                result.errors.push(format!(
-                    "Cherry Studio 记录 {} 导入失败: {error}",
-                    record.request_id
-                ));
-            }
-        }
-    }
-
-    if result.errors.is_empty() {
-        update_sync_state(db, &db_path_str, modified, 0)?;
-    }
-    Ok(result)
+    let records = query_usage_records(&cherry, after_rowid, source_max_rowid)?;
+    import_usage_records(db, &db_path_str, modified, source_max_rowid, &records)
 }
 
 fn has_usage_table(conn: &rusqlite::Connection) -> Result<bool, AppError> {
@@ -150,11 +140,6 @@ fn nonnegative_u32(value: Option<i64>) -> u32 {
     value.unwrap_or(0).clamp(0, u32::MAX as i64) as u32
 }
 
-fn backfill_dedup_ledger(db: &Database) -> Result<(), AppError> {
-    let conn = lock_conn!(db.conn);
-    backfill_dedup_ledger_on_conn(&conn)
-}
-
 pub(crate) fn backfill_dedup_ledger_on_conn(conn: &rusqlite::Connection) -> Result<(), AppError> {
     conn.execute(
         "INSERT OR IGNORE INTO session_usage_dedup
@@ -167,7 +152,20 @@ pub(crate) fn backfill_dedup_ledger_on_conn(conn: &rusqlite::Connection) -> Resu
     Ok(())
 }
 
-fn query_usage_records(conn: &rusqlite::Connection) -> Result<Vec<CherryUsageRecord>, AppError> {
+fn max_usage_rowid(conn: &rusqlite::Connection) -> Result<i64, AppError> {
+    conn.query_row(
+        "SELECT COALESCE(MAX(rowid), 0) FROM ai_usage_record",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(|error| AppError::Database(format!("读取 Cherry Studio 用量游标失败: {error}")))
+}
+
+fn query_usage_records(
+    conn: &rusqlite::Connection,
+    after_rowid: i64,
+    through_rowid: i64,
+) -> Result<Vec<CherryUsageRecord>, AppError> {
     let mut stmt = conn
         .prepare(
             "SELECT request_id, provider_id, provider_name, model_id, model_name,
@@ -175,13 +173,13 @@ fn query_usage_records(conn: &rusqlite::Connection) -> Result<Vec<CherryUsageRec
                     cache_read_tokens, cache_write_tokens, cost, cost_currency,
                     time_first_token_ms, time_completion_ms, created_at
              FROM ai_usage_record
-             WHERE modality = 'language'
-             ORDER BY created_at, id",
+             WHERE rowid > ?1 AND rowid <= ?2 AND modality = 'language'
+             ORDER BY rowid",
         )
         .map_err(|error| AppError::Database(format!("准备 Cherry Studio 用量查询失败: {error}")))?;
 
     let rows = stmt
-        .query_map([], |row| {
+        .query_map(rusqlite::params![after_rowid, through_rowid], |row| {
             let all_input = nonnegative_u32(row.get(5)?);
             let cache_read = nonnegative_u32(row.get(8)?);
             let cache_write = nonnegative_u32(row.get(9)?);
@@ -228,11 +226,37 @@ fn query_usage_records(conn: &rusqlite::Connection) -> Result<Vec<CherryUsageRec
         .map_err(|error| AppError::Database(format!("读取 Cherry Studio 用量行失败: {error}")))
 }
 
-fn insert_usage_record(db: &Database, record: &CherryUsageRecord) -> Result<bool, AppError> {
+fn import_usage_records(
+    db: &Database,
+    file_path: &str,
+    modified: i64,
+    source_rowid: i64,
+    records: &[CherryUsageRecord],
+) -> Result<SessionSyncResult, AppError> {
     let mut conn = lock_conn!(db.conn);
     let tx = conn.transaction()?;
+    let mut result = SessionSyncResult {
+        files_scanned: 1,
+        ..SessionSyncResult::default()
+    };
+    for record in records {
+        if insert_usage_record_on_conn(&tx, record)? {
+            result.imported = result.imported.saturating_add(1);
+        } else {
+            result.skipped = result.skipped.saturating_add(1);
+        }
+    }
+    update_sync_state_on_conn(&tx, file_path, modified, source_rowid)?;
+    tx.commit()?;
+    Ok(result)
+}
+
+fn insert_usage_record_on_conn(
+    conn: &rusqlite::Connection,
+    record: &CherryUsageRecord,
+) -> Result<bool, AppError> {
     let request_id = format!("cherry_studio:{}", record.request_id);
-    let ledger_inserted = tx.execute(
+    let ledger_inserted = conn.execute(
         "INSERT OR IGNORE INTO session_usage_dedup
          (data_source, request_id, semantic_id, has_entry_id)
          VALUES (?1, ?2, ?2, 1)",
@@ -242,7 +266,7 @@ fn insert_usage_record(db: &Database, record: &CherryUsageRecord) -> Result<bool
         return Ok(false);
     }
 
-    tx.execute(
+    conn.execute(
         "INSERT INTO proxy_request_logs (
             request_id, provider_id, app_type, model, request_model,
             input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
@@ -271,7 +295,6 @@ fn insert_usage_record(db: &Database, record: &CherryUsageRecord) -> Result<bool
             DATA_SOURCE,
         ],
     )?;
-    tx.commit()?;
     Ok(true)
 }
 
@@ -314,10 +337,9 @@ mod tests {
             )?;
         }
 
-        backfill_dedup_ledger(&db)?;
-        backfill_dedup_ledger(&db)?;
-
         let conn = lock_conn!(db.conn);
+        backfill_dedup_ledger_on_conn(&conn)?;
+        backfill_dedup_ledger_on_conn(&conn)?;
         let rows: i64 = conn.query_row(
             "SELECT COUNT(*) FROM session_usage_dedup
              WHERE data_source = 'cherry_studio'
@@ -333,6 +355,49 @@ mod tests {
         )?;
         assert_eq!(rows, 1);
         assert_eq!(unrelated_rows, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn regular_sync_does_not_repeat_legacy_backfill() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        {
+            let conn = lock_conn!(db.conn);
+            conn.execute(
+                "INSERT INTO proxy_request_logs
+                    (request_id, provider_id, app_type, model, input_tokens, output_tokens,
+                     latency_ms, status_code, created_at, data_source)
+                 VALUES ('cherry_studio:legacy', 'OpenAI', 'cherry-studio', 'gpt-test',
+                         10, 2, 5, 200, 1, 'cherry_studio')",
+                [],
+            )?;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let cherry_path = temp.path().join("cherrystudio.sqlite");
+        let cherry = rusqlite::Connection::open(&cherry_path)?;
+        cherry.execute_batch(
+            "CREATE TABLE ai_usage_record (
+                id TEXT, request_id TEXT, provider_id TEXT, provider_name TEXT,
+                model_id TEXT, model_name TEXT, modality TEXT, input_tokens INTEGER,
+                output_tokens INTEGER, no_cache_tokens INTEGER, cache_read_tokens INTEGER,
+                cache_write_tokens INTEGER, cost REAL, cost_currency TEXT,
+                time_first_token_ms INTEGER, time_completion_ms INTEGER, created_at INTEGER
+             );",
+        )?;
+        drop(cherry);
+
+        let result = sync_cherry_studio_usage_from_path(&db, &cherry_path)?;
+        assert_eq!(result.imported, 0);
+
+        let conn = lock_conn!(db.conn);
+        let dedup_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM session_usage_dedup
+             WHERE data_source = 'cherry_studio'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(dedup_count, 0);
         Ok(())
     }
 
@@ -471,7 +536,7 @@ mod tests {
 
         let second = sync_cherry_studio_usage_from_path(&db, &cherry_path)?;
         assert_eq!(second.imported, 1);
-        assert_eq!(second.skipped, 1);
+        assert_eq!(second.skipped, 0);
 
         let conn = lock_conn!(db.conn);
         let detail_count: i64 = conn.query_row(
@@ -491,9 +556,66 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
+        let source_cursor: i64 = conn.query_row(
+            "SELECT last_line_offset FROM session_log_sync WHERE file_path = ?1",
+            [cherry_path.to_string_lossy().as_ref()],
+            |row| row.get(0),
+        )?;
         assert_eq!(detail_count, 1);
         assert_eq!(rollup_count, 1);
         assert_eq!(dedup_count, 2);
+        assert_eq!(source_cursor, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn batch_import_rolls_back_rows_and_cursor_together() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        {
+            let conn = lock_conn!(db.conn);
+            conn.execute_batch(
+                "CREATE TRIGGER reject_bad_cherry_record
+                 BEFORE INSERT ON proxy_request_logs
+                 WHEN NEW.request_id = 'cherry_studio:bad'
+                 BEGIN
+                     SELECT RAISE(FAIL, 'rejected test row');
+                 END;",
+            )?;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let cherry_path = temp.path().join("cherrystudio.sqlite");
+        let cherry = rusqlite::Connection::open(&cherry_path)?;
+        cherry.execute_batch(
+            "CREATE TABLE ai_usage_record (
+                id TEXT, request_id TEXT, provider_id TEXT, provider_name TEXT,
+                model_id TEXT, model_name TEXT, modality TEXT, input_tokens INTEGER,
+                output_tokens INTEGER, no_cache_tokens INTEGER, cache_read_tokens INTEGER,
+                cache_write_tokens INTEGER, cost REAL, cost_currency TEXT,
+                time_first_token_ms INTEGER, time_completion_ms INTEGER, created_at INTEGER
+             );
+             INSERT INTO ai_usage_record VALUES
+                ('1', 'good', 'openai', 'OpenAI', 'gpt-test', 'GPT Test',
+                 'language', 10, 2, 8, 0, 0, 0.1, 'USD', 1, 2, 2000),
+                ('2', 'bad', 'openai', 'OpenAI', 'gpt-test', 'GPT Test',
+                 'language', 10, 2, 8, 0, 0, 0.1, 'USD', 1, 2, 3000);",
+        )?;
+        drop(cherry);
+
+        assert!(sync_cherry_studio_usage_from_path(&db, &cherry_path).is_err());
+
+        let conn = lock_conn!(db.conn);
+        let counts: (i64, i64, i64) = conn.query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM proxy_request_logs
+                 WHERE data_source = 'cherry_studio'),
+                (SELECT COUNT(*) FROM session_usage_dedup
+                 WHERE data_source = 'cherry_studio'),
+                (SELECT COUNT(*) FROM session_log_sync WHERE file_path = ?1)",
+            [cherry_path.to_string_lossy().as_ref()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(counts, (0, 0, 0));
         Ok(())
     }
 
@@ -570,7 +692,9 @@ mod tests {
         )
         .unwrap();
 
-        let records = query_usage_records(&conn).unwrap();
+        let max_rowid = max_usage_rowid(&conn).unwrap();
+        let records = query_usage_records(&conn, 0, max_rowid).unwrap();
+        assert_eq!(max_rowid, 2);
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].input_tokens, 60);
         assert_eq!(records[0].model_id, "Model");

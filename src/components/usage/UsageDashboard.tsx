@@ -196,8 +196,9 @@ export function UsageDashboard({
         imported: result.imported,
         files: result.filesScanned,
         errors: result.errors.length,
+        deferred: result.deferredFiles,
       });
-      if (result.errors.length > 0) {
+      if (result.errors.length > 0 || result.deferredFiles > 0) {
         toast.warning(message);
       } else {
         toast.success(message);
